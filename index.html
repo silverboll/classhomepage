@@ -276,6 +276,7 @@ const Auth = {
       const users = await DB.getAll('users');
       const u = users.find(x => x.role === role && String(x.number) === String(number) && x.name === name);
       if (!u) throw new Error(role === 'student' ? '번호와 이름이 맞지 않아요. 다시 확인해 주세요.' : '선생님 번호와 이름이 맞지 않아요.');
+      if ((u.password || PRACTICE_PW) !== password) throw new Error('비밀번호가 맞지 않아요.');
       this.setUser({ uid: u.id, name: u.name, role: u.role, number: u.number });
       return;
     }
@@ -300,6 +301,30 @@ const Auth = {
     if (doc.role !== role) { await FB.au.signOut(FB.auth); throw new Error(`이 계정은 ${doc.role === 'teacher' ? '선생님' : '학생'} 계정이에요. 위 탭을 바꿔 주세요.`); }
     if (doc.name !== name) { await FB.au.signOut(FB.auth); throw new Error('이름이 계정 정보와 달라요.'); }
     this.setUser({ uid, name: doc.name, role: doc.role, number: doc.number });
+  },
+  // 회원가입: 학생 계정만 직접 만들 수 있어요 (선생님 계정은 Firebase 콘솔에서 만들어요)
+  async signup(number, name, password) {
+    if (MODE === 'local') {
+      const users = await DB.getAll('users');
+      if (users.find(x => x.role === 'student' && String(x.number) === String(number))) throw new Error('이미 가입된 번호예요. 로그인해 주세요.');
+      const id = 'u' + uid36();
+      await DB.set('users', id, { name, number: Number(number), role: 'student', password });
+      this.setUser({ uid: id, name, role: 'student', number: Number(number) });
+      return;
+    }
+    const email = `student${Number(number)}@myclass.com`;
+    let cred;
+    try { cred = await FB.au.createUserWithEmailAndPassword(FB.auth, email, password); }
+    catch (e) {
+      const c = e.code || '';
+      if (c.includes('email-already-in-use')) throw new Error('이미 가입된 번호예요. 로그인해 주세요.');
+      if (c.includes('weak-password')) throw new Error('비밀번호는 6자 이상이어야 해요.');
+      if (c.includes('operation-not-allowed')) throw new Error('Firebase 콘솔 → Authentication에서 이메일/비밀번호 로그인을 켜 주세요.');
+      throw new Error('가입하지 못했어요: ' + (e.code || e.message));
+    }
+    const doc = { name, number: Number(number), role: 'student' };
+    await DB.set('users', cred.user.uid, doc);
+    this.setUser({ uid: cred.user.uid, ...doc });
   },
   async logout() {
     if (MODE === 'firebase') await FB.au.signOut(FB.auth);
@@ -341,12 +366,14 @@ function needPerm(feature) {
 /* =====================================================================
    ⑥ 처음 열었을 때 넣어 두는 가짜 샘플 데이터 (실제 개인정보 아님)
    ===================================================================== */
+// 실습용 비밀번호 · 관리자 최초 비밀번호 (실제 비밀번호를 쓰지 마세요)
+const PRACTICE_PW = '000000';
 const NAMES = ['김민준', '이서연', '박지호', '최하윤', '정도윤', '강서아', '조시우', '윤지안', '장하준', '임수아', '한예준', '오지유', '서주원', '신채원', '권은우', '황다은', '안유준', '송하린', '류건우', '전소율', '홍민서', '고태윤', '문가은', '양현우', '배나은'];
 function makeSeed() {
   const T = (d, h = 9, m = 0) => new Date(2026, 10, d, h, m).getTime();
   const ids = (a, b) => Object.fromEntries(Array.from({ length: b - a + 1 }, (_, i) => ['s' + (a + i), true]));
-  const users = { t1: { name: '김선생', number: 1, role: 'teacher' } };
-  NAMES.forEach((n, i) => users['s' + (i + 1)] = { name: n, number: i + 1, role: 'student' });
+  const users = { t1: { name: '김선생', number: 1, role: 'teacher', password: PRACTICE_PW } };
+  NAMES.forEach((n, i) => users['s' + (i + 1)] = { name: n, number: i + 1, role: 'student', password: PRACTICE_PW });
   const post = (title, body, n, d, h, likes = []) => ({ title, body, authorUid: 's' + n, authorName: NAMES[n - 1], createdAt: T(d, h), likes: Object.fromEntries(likes.map(x => ['s' + x, true])), hidden: false });
   return {
     users,
@@ -391,14 +418,14 @@ function makeSeed() {
       e4: { date: '2026-11-27', title: '11월 생일 파티', color: 'pink' }
     },
     points: { g1: { name: '1모둠', score: 24 }, g2: { name: '2모둠', score: 31 }, g3: { name: '3모둠', score: 18 }, g4: { name: '4모둠', score: 27 } },
-    settings: { perms: { ...DEFAULT_PERMS }, admin: { password: '0000' }, class: { size: 25 }, meta: { seeded: true } }
+    settings: { perms: { ...DEFAULT_PERMS }, admin: { password: PRACTICE_PW }, class: { size: 25 }, meta: { seeded: true } }
   };
 }
 function seedLocalIfNeeded(force = false) {
-  if (!force && LS.get('cdx:seeded')) return;
+  if (!force && LS.get('cdx:seeded-v2')) return;
   const seed = makeSeed();
   for (const [path, docs] of Object.entries(seed)) LS.set(lkey(path), docs);
-  LS.set('cdx:seeded', true);
+  LS.set('cdx:seeded-v2', true);
 }
 async function seedFirebaseIfNeeded() {
   try {
@@ -588,9 +615,15 @@ function parseConfig(text) {
    기능 1. 로그인
    ===================================================================== */
 let loginRole = 'student';
+let loginMode = 'login';   // 'login' 또는 'signup'
 function renderLogin() {
-  $('#loginForm').hidden = !!Auth.user;
-  $('#loginTabs').hidden = !!Auth.user;
+  const inUser = !!Auth.user, su = loginMode === 'signup';
+  $('#loginTitle').textContent = su && !inUser ? '참다움 회원가입' : '참다움 로그인';
+  $('#loginForm').hidden = inUser || su;
+  $('#signupForm').hidden = inUser || !su;
+  $('#loginTabs').hidden = inUser || su;
+  $('#switchRow').hidden = inUser;
+  $('#switchBtn').textContent = su ? '이미 계정이 있나요? 로그인' : '계정이 없나요? 회원가입';
   const done = $('#loginDone');
   done.hidden = !Auth.user;
   if (Auth.user) done.innerHTML = `<p class="center big">🎉 <b>${esc(Auth.user.name)}</b>님으로 로그인했어요.</p>
@@ -606,6 +639,36 @@ function bindLogin() {
     $('#loginForm [name=name]').placeholder = loginRole === 'teacher' ? '예: 김선생' : '예: 김민준';
     $('#loginErr').textContent = '';
   });
+  $('#switchBtn').addEventListener('click', () => {
+    loginMode = loginMode === 'login' ? 'signup' : 'login';
+    $('#loginErr').textContent = ''; $('#signupErr').textContent = '';
+    renderLogin();
+    $(loginMode === 'signup' ? '#signupForm [name=number]' : '#loginForm [name=number]').focus();
+  });
+  $('#signupForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = e.target;
+    $('#signupErr').textContent = '';
+    const num = f.number.value.trim();
+    if (!num) { setErr(f.number, '번호 칸이 비어 있어요.'); return; }
+    if (!/^\d{1,2}$/.test(num) || Number(num) < 1) { setErr(f.number, '번호는 1~99 사이 숫자로 써 주세요.'); return; }
+    setErr(f.number, '');
+    const name = validate(f.name, '이름', 10); if (name == null) return;
+    const pw = f.password.value;
+    if (pw.length < 6) { setErr(f.password, '비밀번호는 6자 이상이에요.'); return; }
+    if (pw.length > 20) { setErr(f.password, '비밀번호는 20자까지예요.'); return; }
+    setErr(f.password, '');
+    if (f.password2.value !== pw) { setErr(f.password2, '비밀번호가 서로 달라요.'); return; }
+    setErr(f.password2, '');
+    const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
+    try {
+      await Auth.signup(num, name, pw);
+      f.reset(); loginMode = 'login';
+      toast(`${name}님, 가입을 환영해요!`, 'success');
+      location.hash = 'home';
+    } catch (err) { $('#signupErr').textContent = err.message; }
+    finally { btn.disabled = false; }
+  });
   $('#loginForm').addEventListener('submit', async e => {
     e.preventDefault();
     const f = e.target, numI = f.number, nameI = f.name, pwI = f.password;
@@ -615,8 +678,10 @@ function bindLogin() {
     if (!/^\d{1,2}$/.test(num) || Number(num) < 1) { setErr(numI, '번호는 1~99 사이 숫자로 써 주세요.'); return; }
     setErr(numI, '');
     const name = validate(nameI, '이름', 10); if (name == null) return;
-    let pw = '';
-    if (MODE === 'firebase') { pw = pwI.value; if (pw.length < 6) { setErr(pwI, '비밀번호는 6자 이상이에요.'); return; } setErr(pwI, ''); }
+    const pw = pwI.value;
+    if (!pw) { setErr(pwI, '비밀번호 칸이 비어 있어요.'); return; }
+    if (pw.length < 6) { setErr(pwI, '비밀번호는 6자 이상이에요.'); return; }
+    setErr(pwI, '');
     const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
     try {
       await Auth.login(loginRole, num, name, pw);
@@ -1064,7 +1129,7 @@ function renderAdmin() {
         <p>관리자 비밀번호를 입력해 주세요.</p>
         <input type="password" name="pw" inputmode="numeric" placeholder="비밀번호" autocomplete="off">
         <button class="btn block">들어가기</button>
-        <p class="hint">처음 비밀번호는 <b>0000</b>이에요. (연습용 잠금이에요)</p></form>`;
+        <p class="hint">처음 비밀번호는 <b>000000</b>이에요. (연습용 잠금이에요)</p></form>`;
     } else {
       el.innerHTML = `<div class="admin-head"><div><p class="kicker">선생님 전용</p><h2 class="title">관리자 페이지</h2></div>
           <button class="btn sm ghost" data-act="adminExit">관리자 나가기</button></div>
@@ -1123,7 +1188,7 @@ function bindAdmin() {
     e.preventDefault();
     const inp = e.target.pw;
     if (!inp.value) { setErr(inp, '비밀번호를 입력해 주세요.'); return; }
-    if (inp.value !== String(S.settings.admin?.password ?? '0000')) { setErr(inp, '비밀번호가 맞지 않아요.'); inp.select(); return; }
+    if (inp.value !== String(S.settings.admin?.password ?? PRACTICE_PW)) { setErr(inp, '비밀번호가 맞지 않아요.'); inp.select(); return; }
     SS.set('cdx:admin', '1'); toast('관리자 모드로 들어왔어요.', 'success'); renderAdmin();
   });
   $('#adminBox').addEventListener('change', async e => {
@@ -1585,7 +1650,7 @@ body.fb-mode .local-only{display:none}
   <!-- 3. 로그인 -->
   <section class="page" data-page="page3">
     <div class="card login-card">
-      <h2 class="title center">참다움 로그인</h2>
+      <h2 class="title center" id="loginTitle">참다움 로그인</h2>
       <div class="seg" id="loginTabs" role="tablist">
         <button type="button" class="on" data-role="student" role="tab" aria-selected="true">학생</button>
         <button type="button" data-role="teacher" role="tab" aria-selected="false">선생님</button>
@@ -1593,14 +1658,24 @@ body.fb-mode .local-only{display:none}
       <form id="loginForm" novalidate>
         <label><span id="numLabel">번호</span><input name="number" inputmode="numeric" placeholder="예: 1" autocomplete="off"></label>
         <label>이름<input name="name" placeholder="예: 김민준" autocomplete="off"></label>
-        <label class="fb-only">비밀번호<input name="password" type="password" placeholder="수업용 연습 비밀번호" autocomplete="current-password"></label>
+        <label>비밀번호<input name="password" type="password" placeholder="실습용 비밀번호 (예: 000000)" autocomplete="current-password"></label>
         <p class="form-err" id="loginErr" role="alert"></p>
         <button type="submit" class="btn block">로그인</button>
       </form>
+      <form id="signupForm" novalidate hidden>
+        <p class="hint center">학생 계정을 새로 만들어요. 선생님 계정은 담임 선생님이 따로 만들어요.</p>
+        <label>번호<input name="number" inputmode="numeric" placeholder="예: 26" autocomplete="off"></label>
+        <label>이름<input name="name" placeholder="예: 홍길동" autocomplete="off"></label>
+        <label>비밀번호<input name="password" type="password" placeholder="6자 이상 (실습용: 000000)" autocomplete="new-password"></label>
+        <label>비밀번호 확인<input name="password2" type="password" placeholder="한 번 더 입력" autocomplete="new-password"></label>
+        <p class="form-err" id="signupErr" role="alert"></p>
+        <button type="submit" class="btn block yellow">회원가입</button>
+      </form>
+      <p class="center" id="switchRow" style="margin:14px 0 0"><button type="button" class="link" id="switchBtn" style="text-decoration:underline">계정이 없나요? 회원가입</button></p>
       <div id="loginDone" hidden></div>
       <p class="warn">⚠️ <b>실제 비밀번호를 쓰지 마세요.</b> 수업용 연습 계정만 사용해요.</p>
-      <p class="hint local-only">연습용 계정 — 학생: <b>1번 김민준</b>, 2번 이서연 … 25번까지 · 선생님: <b>1번 김선생</b></p>
-      <p class="hint fb-only">계정은 <code>student1@myclass.com</code>, <code>teacher1@myclass.com</code> 같은 수업용 이메일로 만들어져 있어요.</p>
+      <p class="hint local-only">연습용 계정 — 학생: <b>1번 김민준</b>, 2번 이서연 … 25번까지 · 선생님: <b>1번 김선생</b> · 비밀번호는 모두 <b>000000</b></p>
+      <p class="hint fb-only">회원가입하면 <code>student번호@myclass.com</code> 같은 수업용 이메일 계정이 자동으로 만들어져요. 실습용 비밀번호는 <b>000000</b>을 써요.</p>
     </div>
   </section>
 
