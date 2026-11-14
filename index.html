@@ -16,12 +16,13 @@
      ⚠️ 하지만 AI·결제 같은 유료 API 키는 절대 이 파일에 넣지 마세요!
    ===================================================================== */
 const firebaseConfig = {
-  apiKey: "여기에_붙여넣기",
-  authDomain: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: ""
+  apiKey: "AIzaSyCEQpAm0CxJDpGtIwzUcNKNhVKTHrSqiWY",
+  authDomain: "chamdaum-22a94.firebaseapp.com",
+  projectId: "chamdaum-22a94",
+  storageBucket: "chamdaum-22a94.firebasestorage.app",
+  messagingSenderId: "722134208223",
+  appId: "1:722134208223:web:f473d072b472b10a68e36a",
+  measurementId: "G-2MCSBVC5RB"
 };
 
 /* =====================================================================
@@ -458,14 +459,11 @@ function renderAuth() {
 }
 
 /* ---------- 상단 안내 띠 (실시간 연동 전) ---------- */
+// 위쪽 안내 띠는 지웠어요. 연동 상태는 푸터 오른쪽 아래에 작게 보여 줘요.
 function renderBanner() {
-  const b = $('#syncBanner');
-  if (MODE === 'firebase') { b.hidden = true; $('#syncState').textContent = '● 실시간 연동 중'; $('#syncState').classList.add('on'); return; }
-  b.hidden = false;
-  $('#bannerText').textContent = fbError
-    ? 'Firebase에 연결하지 못해서 이 기기에만 저장돼요. (채팅 미리보기에서는 외부 연결이 막혀 있어요)'
-    : '실시간 연동 전이라 이 기기에만 저장돼요.';
-  $('#syncState').textContent = '○ 이 기기에만 저장 중';
+  const st = $('#syncState');
+  if (MODE === 'firebase') { st.textContent = '● 실시간 연동 중'; st.classList.add('on'); return; }
+  st.textContent = fbError ? '○ 연결 안 됨 · 이 기기에만 저장 중' : '○ 이 기기에만 저장 중';
 }
 
 const RULES = `rules_version = '2';
@@ -1244,8 +1242,6 @@ code{background:rgba(44,70,80,.08);padding:1px 6px;border-radius:6px;font-size:.
 .tag{font-style:normal;font-size:.72rem;background:rgba(232,131,126,.18);color:#A9443D;padding:1px 8px;border-radius:999px;margin-left:6px;white-space:nowrap}
 .tag.post{background:rgba(63,140,153,.15);color:var(--teal)}
 
-/* ---- 안내 띠 ---- */
-.banner{background:var(--pencil);display:flex;gap:12px;align-items:center;justify-content:center;flex-wrap:wrap;padding:8px 16px;font-size:.9rem;text-align:center}
 
 /* ---- 헤더 ---- */
 .site-header{position:sticky;top:0;z-index:20;background:rgba(175,216,223,.88);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
@@ -1527,10 +1523,6 @@ body.fb-mode .local-only{display:none}
 </head>
 <body>
 
-<div id="syncBanner" class="banner" hidden>
-  <span>☁️ <span id="bannerText">실시간 연동 전이라 이 기기에만 저장돼요.</span></span>
-  <button class="btn sm" data-act="fbConfig">Firebase 설정값 붙여 넣기</button>
-</div>
 
 <!-- 연필 그림 (참고 이미지의 연필을 닮게) -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
