@@ -121,6 +121,21 @@ function validate(input, label, max, min = 1) {
 }
 document.addEventListener('input', e => { if (e.target.classList?.contains('invalid')) setErr(e.target, ''); });
 
+function fbMsg(e, fallback) {
+  const c = (e && e.code) || '';
+  if (c.includes('invalid-credential') || c.includes('wrong-password') || c.includes('user-not-found') || c.includes('invalid-email'))
+    return '번호나 비밀번호가 맞지 않아요. 아직 가입하지 않았다면 아래 [회원가입]을 먼저 해 주세요.';
+  if (c.includes('too-many-requests')) return '너무 많이 시도했어요. 잠시 후 다시 해 주세요.';
+  if (c.includes('operation-not-allowed') || c.includes('configuration-not-found'))
+    return 'Firebase 콘솔 → Authentication → 로그인 방법에서 [이메일/비밀번호]를 켜 주세요.';
+  if (c.includes('unauthorized-domain') || c.includes('requests-from-referer'))
+    return '이 주소는 허용되지 않았어요. Firebase 콘솔 → Authentication → 설정 → 승인된 도메인에 지금 사이트 주소를 추가해 주세요.';
+  if (c.includes('network-request-failed')) return '인터넷 연결을 확인해 주세요.';
+  if (c === 'permission-denied') return '보안 규칙 때문에 막혔어요. Firestore 규칙을 최신 것으로 다시 게시해 주세요.';
+  if (c === 'unavailable' || c.includes('offline') || /offline/i.test(e?.message || ''))
+    return 'Firestore 데이터베이스에 연결하지 못했어요. Firebase 콘솔에서 [Firestore Database]를 만들었는지 확인해 주세요.';
+  return fallback + (c || e?.message || e);
+}
 const errMsg = e => (e && e.code === 'permission-denied') ? '권한이 없어서 저장하지 못했어요. (보안 규칙을 확인해 주세요)' : '문제가 생겼어요: ' + (e?.message || e);
 
 // 날짜 도구
@@ -145,6 +160,7 @@ let DB = null;
 let MODE = 'local';      // 'local' 또는 'firebase'
 let FB = null;           // Firebase Auth 도구
 let fbError = null;
+let READY = false;        // 저장소 준비가 끝나야 로그인할 수 있어요
 
 // ---- localStorage 버전 ----
 const listeners = new Map();
@@ -216,6 +232,13 @@ function makeFirebaseDB(fs, db) {
       return fs.onSnapshot(fs.collectionGroup(db, name),
         s => cb(s.docs.map(d => ({ id: d.id, ...d.data(), _path: d.ref.parent.path, _parent: d.ref.parent.parent?.path }))), onErr);
     },
+    // 첫 선생님 가입: users 문서와 settings/teacherClaim을 한 번에 저장해요
+    async claimTeacher(uid, doc) {
+      const b = fs.writeBatch(db);
+      b.set(dref('settings', 'teacherClaim'), { uid, at: Date.now() });
+      b.set(dref('users', uid), doc);
+      await b.commit();
+    },
     async castVote(voteId, option, voterId) {
       const vr = dref(`votes/${voteId}/voters`, voterId);
       if ((await fs.getDoc(vr)).exists()) return 'already';
@@ -238,7 +261,7 @@ function getConfig() {
 async function initFirebase(cfg) {
   const base = 'https://www.gstatic.com/firebasejs/10.12.2/';
   const load = Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-firestore.js'), import(base + 'firebase-auth.js')]);
-  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('Firebase를 불러오는 데 시간이 너무 오래 걸려요')), 8000));
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('Firebase를 불러오는 데 시간이 너무 오래 걸려요')), 5000));
   const [appM, fs, au] = await Promise.race([load, timeout]);
   const app = appM.initializeApp(cfg);
   const db = fs.getFirestore(app);
@@ -275,7 +298,7 @@ const Auth = {
     if (MODE === 'local') {
       const users = await DB.getAll('users');
       const u = users.find(x => x.role === role && String(x.number) === String(number) && x.name === name);
-      if (!u) throw new Error(role === 'student' ? '번호와 이름이 맞지 않아요. 다시 확인해 주세요.' : '선생님 번호와 이름이 맞지 않아요.');
+      if (!u) throw new Error(role === 'student' ? '번호와 이름이 맞지 않아요. 아직 가입하지 않았다면 [회원가입]을 먼저 해 주세요.' : '선생님 번호와 이름이 맞지 않아요. (연습용: 1번 김선생)');
       if ((u.password || PRACTICE_PW) !== password) throw new Error('비밀번호가 맞지 않아요.');
       this.setUser({ uid: u.id, name: u.name, role: u.role, number: u.number });
       return;
@@ -284,46 +307,50 @@ const Auth = {
     const email = `${role}${Number(number)}@myclass.com`;
     let cred;
     try { cred = await FB.au.signInWithEmailAndPassword(FB.auth, email, password); }
-    catch (e) {
-      const c = e.code || '';
-      if (c.includes('invalid-credential') || c.includes('wrong-password') || c.includes('user-not-found') || c.includes('invalid-email'))
-        throw new Error('번호나 비밀번호가 맞지 않아요.');
-      if (c.includes('too-many-requests')) throw new Error('너무 많이 시도했어요. 잠시 후 다시 해 주세요.');
-      throw new Error('로그인하지 못했어요: ' + (e.code || e.message));
-    }
+    catch (e) { throw new Error(fbMsg(e, '로그인하지 못했어요: ')); }
     const uid = cred.user.uid;
-    let doc = await DB.get('users', uid);
-    if (!doc) {
-      if (role === 'teacher') { await FB.au.signOut(FB.auth); throw new Error('선생님 정보(users 문서)가 아직 없어요. 설정 안내 6번을 확인해 주세요.'); }
-      doc = { name, number: Number(number), role: 'student' };
-      await DB.set('users', uid, doc);
-    }
+    let doc;
+    try {
+      doc = await DB.get('users', uid);
+      if (!doc) {
+        if (role === 'teacher') { await FB.au.signOut(FB.auth); throw new Error('선생님 정보가 아직 없어요. [회원가입]에서 선생님으로 가입해 주세요.'); }
+        doc = { name, number: Number(number), role: 'student' };
+        await DB.set('users', uid, doc);
+      }
+    } catch (e) { if (!e.code) throw e; await FB.au.signOut(FB.auth); throw new Error(fbMsg(e, '계정 정보를 불러오지 못했어요: ')); }
     if (doc.role !== role) { await FB.au.signOut(FB.auth); throw new Error(`이 계정은 ${doc.role === 'teacher' ? '선생님' : '학생'} 계정이에요. 위 탭을 바꿔 주세요.`); }
     if (doc.name !== name) { await FB.au.signOut(FB.auth); throw new Error('이름이 계정 정보와 달라요.'); }
     this.setUser({ uid, name: doc.name, role: doc.role, number: doc.number });
   },
-  // 회원가입: 학생 계정만 직접 만들 수 있어요 (선생님 계정은 Firebase 콘솔에서 만들어요)
-  async signup(number, name, password) {
+  // 회원가입: 학생은 누구나, 선생님은 가입 코드가 필요해요
+  async signup(role, number, name, password) {
+    const isT = role === 'teacher';
+    const doc = { name, number: Number(number), role };
     if (MODE === 'local') {
       const users = await DB.getAll('users');
-      if (users.find(x => x.role === 'student' && String(x.number) === String(number))) throw new Error('이미 가입된 번호예요. 로그인해 주세요.');
+      if (users.find(x => x.role === role && String(x.number) === String(number))) throw new Error('이미 가입된 번호예요. 로그인해 주세요.');
       const id = 'u' + uid36();
-      await DB.set('users', id, { name, number: Number(number), role: 'student', password });
-      this.setUser({ uid: id, name, role: 'student', number: Number(number) });
+      await DB.set('users', id, { ...doc, password });
+      this.setUser({ uid: id, ...doc });
       return;
     }
-    const email = `student${Number(number)}@myclass.com`;
+    const email = `${role}${Number(number)}@myclass.com`;
     let cred;
     try { cred = await FB.au.createUserWithEmailAndPassword(FB.auth, email, password); }
     catch (e) {
       const c = e.code || '';
       if (c.includes('email-already-in-use')) throw new Error('이미 가입된 번호예요. 로그인해 주세요.');
       if (c.includes('weak-password')) throw new Error('비밀번호는 6자 이상이어야 해요.');
-      if (c.includes('operation-not-allowed')) throw new Error('Firebase 콘솔 → Authentication에서 이메일/비밀번호 로그인을 켜 주세요.');
-      throw new Error('가입하지 못했어요: ' + (e.code || e.message));
+      throw new Error(fbMsg(e, '가입하지 못했어요: '));
     }
-    const doc = { name, number: Number(number), role: 'student' };
-    await DB.set('users', cred.user.uid, doc);
+    try {
+      if (isT) await DB.claimTeacher(cred.user.uid, doc);
+      else await DB.set('users', cred.user.uid, doc);
+    } catch (e) {
+      try { await cred.user.delete(); } catch {}   // 반쯤 만들어진 계정은 지워요
+      if (isT && e.code === 'permission-denied') throw new Error('이미 선생님 계정이 있어요. 선생님을 더 추가하려면 Firebase 콘솔에서 만들어 주세요.');
+      throw new Error(fbMsg(e, '가입 정보를 저장하지 못했어요: '));
+    }
     this.setUser({ uid: cred.user.uid, ...doc });
   },
   async logout() {
@@ -368,6 +395,8 @@ function needPerm(feature) {
    ===================================================================== */
 // 실습용 비밀번호 · 관리자 최초 비밀번호 (실제 비밀번호를 쓰지 마세요)
 const PRACTICE_PW = '000000';
+// 선생님 회원가입 코드 (연습용). 진짜 잠금은 보안 규칙: '맨 처음 가입한 선생님 1명'만 웹에서 가입할 수 있어요.
+const TEACHER_CODE = '000000';
 const NAMES = ['김민준', '이서연', '박지호', '최하윤', '정도윤', '강서아', '조시우', '윤지안', '장하준', '임수아', '한예준', '오지유', '서주원', '신채원', '권은우', '황다은', '안유준', '송하린', '류건우', '전소율', '홍민서', '고태윤', '문가은', '양현우', '배나은'];
 function makeSeed() {
   const T = (d, h = 9, m = 0) => new Date(2026, 10, d, h, m).getTime();
@@ -506,10 +535,15 @@ service cloud.firestore {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
     }
 
-    // 로그인: 학생은 내 정보를 '학생' 역할로만 만들 수 있어요 (선생님 역할은 콘솔에서 직접 지정)
+    // 로그인: 학생은 '학생' 역할로 가입하고, 선생님은 맨 처음 1명만 웹에서 가입할 수 있어요
     match /users/{uid} {
       allow read: if signedIn();
-      allow create: if signedIn() && request.auth.uid == uid && request.resource.data.role == 'student';
+      allow create: if signedIn() && request.auth.uid == uid && (
+        request.resource.data.role == 'student'
+        // 선생님 가입은 '맨 처음 1명'만: settings/teacherClaim을 함께 만들 때만 허용
+        || (request.resource.data.role == 'teacher'
+            && !exists(/databases/$(database)/documents/settings/teacherClaim)
+            && getAfter(/databases/$(database)/documents/settings/teacherClaim).data.uid == request.auth.uid));
       allow update, delete: if isTeacher();
     }
 
@@ -562,6 +596,10 @@ service cloud.firestore {
     match /events/{id}    { allow read: if true; allow write: if isTeacher(); }
     match /points/{id}    { allow read: if true; allow write: if isTeacher(); }
     match /settings/{id}  { allow read: if true; allow write: if isTeacher(); }
+    // 첫 선생님 가입 표시 (한 번만 만들 수 있어요)
+    match /settings/teacherClaim {
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+    }
   }
 }`;
 
@@ -578,10 +616,9 @@ function openConfigModal() {
           <li>프로젝트 설정 → 내 앱 → <b>웹 앱(&lt;/&gt;) 등록</b> → 나오는 firebaseConfig 복사</li>
           <li>빌드 → <b>Firestore Database</b> → 데이터베이스 만들기</li>
           <li>빌드 → <b>Authentication</b> → 로그인 방법 → <b>이메일/비밀번호</b> 사용 설정</li>
-          <li>Authentication → 사용자 추가: <code>teacher1@myclass.com</code>, <code>student1@myclass.com</code> … (연습용 비밀번호)</li>
-          <li>Firestore → <code>users</code> 컬렉션 → 문서 ID에 선생님 계정의 <b>사용자 UID</b> → 필드 <code>name</code>(이름), <code>number</code>(1), <code>role</code>("teacher")</li>
           <li>Firestore → 규칙 탭에 아래 보안 규칙을 붙여 넣고 <b>게시</b></li>
-          <li>이 창에 firebaseConfig를 붙여 넣기 → 두 기기에서 동시에 열어 확인하기</li>
+          <li>사이트에서 <b>회원가입 → 선생님 탭</b>으로 맨 먼저 선생님 계정 만들기 (가입 코드 000000)</li>
+          <li>학생들은 회원가입 → 학생 탭으로 가입 → 두 기기에서 동시에 열어 확인하기</li>
         </ol>
         <button type="button" class="btn sm ghost" data-copy>보안 규칙 복사하기</button>
         <pre class="rules">${esc(RULES)}</pre>
@@ -621,7 +658,11 @@ function renderLogin() {
   $('#loginTitle').textContent = su && !inUser ? '참다움 회원가입' : '참다움 로그인';
   $('#loginForm').hidden = inUser || su;
   $('#signupForm').hidden = inUser || !su;
-  $('#loginTabs').hidden = inUser || su;
+  $('#loginTabs').hidden = inUser;
+  $('#teacherCodeRow').hidden = !(su && loginRole === 'teacher');
+  $('#signupNote').textContent = loginRole === 'teacher'
+    ? '선생님 계정을 만들어요. 선생님 가입 코드(연습용: 000000)가 필요해요.'
+    : '학생 계정을 새로 만들어요.';
   $('#switchRow').hidden = inUser;
   $('#switchBtn').textContent = su ? '이미 계정이 있나요? 로그인' : '계정이 없나요? 회원가입';
   const done = $('#loginDone');
@@ -637,7 +678,9 @@ function bindLogin() {
     $('#numLabel').textContent = loginRole === 'teacher' ? '선생님 번호' : '번호';
     $('#loginForm [name=number]').placeholder = loginRole === 'teacher' ? '예: 1' : '예: 1';
     $('#loginForm [name=name]').placeholder = loginRole === 'teacher' ? '예: 김선생' : '예: 김민준';
-    $('#loginErr').textContent = '';
+    $('#signupForm [name=name]').placeholder = loginRole === 'teacher' ? '예: 김선생' : '예: 홍길동';
+    $('#loginErr').textContent = ''; $('#signupErr').textContent = '';
+    renderLogin();
   });
   $('#switchBtn').addEventListener('click', () => {
     loginMode = loginMode === 'login' ? 'signup' : 'login';
@@ -660,9 +703,15 @@ function bindLogin() {
     setErr(f.password, '');
     if (f.password2.value !== pw) { setErr(f.password2, '비밀번호가 서로 달라요.'); return; }
     setErr(f.password2, '');
+    if (loginRole === 'teacher') {
+      if (!f.tcode.value.trim()) { setErr(f.tcode, '선생님 가입 코드를 입력해 주세요.'); return; }
+      if (f.tcode.value.trim() !== TEACHER_CODE) { setErr(f.tcode, '선생님 가입 코드가 맞지 않아요.'); return; }
+      setErr(f.tcode, '');
+    }
+    if (!READY) { $('#signupErr').textContent = '아직 연결하는 중이에요. 잠시 후 다시 눌러 주세요.'; return; }
     const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
     try {
-      await Auth.signup(num, name, pw);
+      await Auth.signup(loginRole, num, name, pw);
       f.reset(); loginMode = 'login';
       toast(`${name}님, 가입을 환영해요!`, 'success');
       location.hash = 'home';
@@ -682,6 +731,7 @@ function bindLogin() {
     if (!pw) { setErr(pwI, '비밀번호 칸이 비어 있어요.'); return; }
     if (pw.length < 6) { setErr(pwI, '비밀번호는 6자 이상이에요.'); return; }
     setErr(pwI, '');
+    if (!READY) { $('#loginErr').textContent = '아직 연결하는 중이에요. 잠시 후 다시 눌러 주세요.'; return; }
     const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
     try {
       await Auth.login(loginRole, num, name, pw);
@@ -1275,7 +1325,8 @@ async function boot() {
   renderBanner();
   rerenderAll();
   startWatchers();
-  if (fbError) toast('Firebase에 연결하지 못해서 이 기기에만 저장해요.', 'error');
+  READY = true;
+  if (fbError) toast('Firebase에 연결되지 않아 이 기기에만 저장해요. (채팅 미리보기에선 정상이에요)');
 }
 boot();
 </script>
@@ -1663,11 +1714,12 @@ body.fb-mode .local-only{display:none}
         <button type="submit" class="btn block">로그인</button>
       </form>
       <form id="signupForm" novalidate hidden>
-        <p class="hint center">학생 계정을 새로 만들어요. 선생님 계정은 담임 선생님이 따로 만들어요.</p>
+        <p class="hint center" id="signupNote">학생 계정을 새로 만들어요.</p>
         <label>번호<input name="number" inputmode="numeric" placeholder="예: 26" autocomplete="off"></label>
         <label>이름<input name="name" placeholder="예: 홍길동" autocomplete="off"></label>
         <label>비밀번호<input name="password" type="password" placeholder="6자 이상 (실습용: 000000)" autocomplete="new-password"></label>
         <label>비밀번호 확인<input name="password2" type="password" placeholder="한 번 더 입력" autocomplete="new-password"></label>
+        <label id="teacherCodeRow" hidden>선생님 가입 코드<input name="tcode" type="password" placeholder="연습용: 000000" autocomplete="off"></label>
         <p class="form-err" id="signupErr" role="alert"></p>
         <button type="submit" class="btn block yellow">회원가입</button>
       </form>
